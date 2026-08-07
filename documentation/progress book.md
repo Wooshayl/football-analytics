@@ -113,6 +113,54 @@ Le notebook `01_data_cleaner.ipynb` documente l'intégralité de ce pipeline, de
 
 ---
 
+## Étape 8 — Conversion finale de qualifiers en JSON valide
+
+La colonne `qualifiers`, telle qu'exportée dans les étapes précédentes, restait une représentation Python (`repr()`, guillemets simples), invalide en JSON strict et donc incompatible avec un typage `JSONB` en PostgreSQL. Convertie via `ast.literal_eval` puis `json.dumps`, avec vérification systématique de chaque ligne par un vrai parseur JSON avant réexport (0 ligne invalide sur 467 318).
+
+---
+
+## Étape 9 — Mise en place de Supabase et création du schéma SQL
+
+Projet Supabase créé (région Paris, plan Free, Data API activée, RLS automatique activée par défaut sur les nouvelles tables). Les 6 tables ont été créées via `CREATE TABLE` dans le SQL Editor, dans l'ordre imposé par les dépendances de clés étrangères : `football_team` et `players` (aucune dépendance), puis `football_match` (référence `football_team`), `team_player` (référence les deux précédentes, clé primaire composite `(team_id, player_id)`), `player_match_stats` (référence les trois précédentes, clé composite `(player_id, match_id)`), et enfin `events` (la plus riche, avec `qualifiers` en `JSONB`).
+
+**Décision retenue pour `event_id`**, cohérente avec le problème identifié à l'étape 5 : la table `events` utilise `event_pk` (généré côté pandas) comme véritable clé primaire, `event_id` étant conservé sans contrainte d'unicité, à titre informatif seulement.
+
+---
+
+## Étape 10 — Import des données et problèmes rencontrés
+
+**Renommage de colonnes nécessaire avant import.** Les noms de colonnes des CSV ne correspondaient pas tous exactement aux noms définis dans le schéma SQL : `team` → `team_name`, `player` → `player_name` (uniquement sur `players.csv`, `events.csv` garde `team`/`player` tels quels côté SQL), `week` → `matchday`, suppression des colonnes `round`/`day`/`time` restées dans `matches.csv` malgré une décision de suppression antérieure, et suppression de la colonne `game_id` redondante avec `match_id` dans `events.csv`.
+
+**Problème récurrent — colonnes entières exportées en `float64` à cause des valeurs manquantes.** Toute colonne destinée à être un `INT`/`BIGINT` en SQL mais contenant des `NaN` côté pandas (ex. `player_id` sur les événements sans joueur, `transfermarkt_id` pour les joueurs non matchés) est automatiquement stockée en `float64` par pandas, ce qui donne des valeurs du type `"348654.0"` à l'export CSV — rejetées par Postgres avec l'erreur `invalid input syntax for type integer`. Corrigé en convertissant ces colonnes au type `Int64` (I majuscule, le type entier nullable de pandas, distinct du `int64` natif) avant export. Point important découvert en cours de route : **ce typage `Int64` ne survit pas à un aller-retour par CSV** — relire un CSV avec `pd.read_csv()` fait retomber les colonnes en `float64` même si elles avaient été correctement typées avant l'export précédent. La conversion `Int64` a donc dû être répétée directement dans le script d'import Python, juste après la lecture du CSV, plutôt que de compter sur le fichier lui-même pour la conserver.
+
+**Import via l'interface web Supabase limité en taille de fichier.** Les tables `players`, `football_team`, `football_match` et `team_player` (fichiers de quelques centaines de Ko à quelques Mo) se sont importées sans problème via l'interface Table Editor. `events.csv` (467 318 lignes, 226 Mo) a échoué à deux reprises via cette méthode (import interrompu autour de 3800 puis 146 504 lignes), très probablement à cause d'une limite de taille de fichier côté interface web (l'ordre de grandeur de 50 Mo a été évoqué) combinée à une possible interruption liée à la navigation hors de la page pendant l'upload.
+
+**Solution retenue — import par lots via `supabase-py` en Python.** Script utilisant `create_client()` et des insertions par paquets de 5000 lignes (`batch_size`), avec suivi de progression affiché à chaque lot. Plusieurs obstacles rencontrés et résolus dans l'ordre :
+1. **`NaN` invalide en JSON** : `df.where(pd.notnull(df), None)` ne fonctionne pas tel quel sur des colonnes `float64`, car un tableau numpy ne peut pas stocker de `None` — la valeur est silencieusement reconvertie en `NaN`, qui n'est pas un JSON valide (`ValueError: Out of range float values are not JSON compliant: nan`). Corrigé en forçant `.astype(object)` avant le remplacement, pour que `None` soit réellement conservé tel quel.
+2. **Permissions RLS bloquant l'écriture.** La clé `anon`/`publishable` n'ayant volontairement que des droits de lecture (policies `SELECT` créées uniquement), l'insertion via cette clé a échoué (`permission denied for table events`). Résolu en utilisant la clé `service_role`/`secret` (qui contourne RLS) pour ce script d'import ponctuel uniquement — jamais utilisée côté application. Un `GRANT SELECT, INSERT ON public.events TO service_role` a aussi été nécessaire, RLS n'exemptant pas automatiquement `service_role` des droits de base au niveau table.
+3. **Résidu `player_id = 0` et `related_player_id = 0`**, le même fantôme de données déjà rencontré à plusieurs reprises dans le projet (voir étapes 4 et 6), cette fois bloquant l'import via une violation de contrainte de clé étrangère (`Key (related_player_id)=(0) is not present in table "players"`). Corrigé en remplaçant ces valeurs `0` par `NA` (`pd.NA`) plutôt que de supprimer les lignes concernées — l'événement reste valide, seul le lien vers un joueur devient nul, cohérent avec le traitement déjà appliqué aux événements sans joueur (`Start`, `End`...).
+4. **Reprise sur erreur sans tout réimporter.** Grâce au `batch_size` et au suivi de progression affiché, l'import interrompu à 340 000/467 318 lignes a pu reprendre exactement à ce point (`start = 340000` dans la boucle) après correction du problème de données, sans nécessiter de réinsérer les lots déjà passés avec succès ni de vider la table.
+
+**Nettoyage de sécurité post-import.** Les droits d'écriture temporairement accordés à `anon` (`GRANT INSERT ... TO anon` et la policy associée) ont vocation à être retirés une fois l'import définitivement validé, afin que la clé publique utilisée par l'application Streamlit ne conserve que des droits de lecture.
+
+---
+
+## État actuel — validation finale
+
+Tests de cohérence exécutés directement en SQL pour valider la base de bout en bout :
+- Comptage des 6 tables conforme aux volumes attendus (18 / 550 / 306 / 560 / 9413 / 467 318).
+- Une jointure à trois tables (`player_match_stats` ⋈ `players` ⋈ `football_team`) fonctionne correctement (test effectué sur les buteurs du club WhoScored nommé "PSG" — à noter que `teams.csv`, extrait directement de WhoScored, conserve cette abréviation, contrairement au nom complet "Paris Saint-Germain" utilisé côté FBref lors du merge des calendriers à l'étape 2 ; les deux sources n'ont jamais eu besoin d'être harmonisées entre elles au niveau de `football_team`, chaque table restant cohérente avec sa propre source d'origine).
+- Une requête JSONB sur `qualifiers` (recherche d'un `OwnGoal`) retourne des résultats exploitables, confirmant que le typage JSONB est fonctionnel.
+- Aucun résidu `player_id = 0` ou `related_player_id = 0` ne subsiste dans `events`.
+
+---
+
+## Mise en ligne sur GitHub
+
+Le projet a été initialisé avec Git et poussé sur un dépôt GitHub (`Wooshayl/football-analytics`). Point de vigilance appliqué avant le premier commit : exclusion de `data/raw/*.csv` et `data/processed/*.csv` du suivi Git (le fichier `events.csv` à lui seul pèse 226 Mo, largement au-dessus de la limite de 100 Mo imposée par GitHub, et l'ensemble des CSV `processed/` est de toute façon intégralement reproductible à partir des données brutes et du notebook `01_data_cleaner.ipynb`, donc sans intérêt à versionner). Le fichier `.env` contenant les clés Supabase a également été vérifié comme exclu avant chaque commit.
+
+---
+
 ## Prochaine étape
 
-Mise en place de la base Supabase : création du projet (fait), écriture et exécution du schéma SQL (`CREATE TABLE` avec clés primaires/étrangères adaptées aux limitations identifiées ci-dessus, `qualifiers` en `JSONB`), import des 6 CSV dans l'ordre des dépendances, puis configuration des policies RLS pour permettre la lecture publique depuis la future application Streamlit.
+Nettoyage final des droits temporaires accordés à `anon` sur `events`, puis démarrage de l'application Streamlit : structure multi-pages, connexion à Supabase via la clé `publishable` (lecture seule), et premières pages (fiches joueurs, classements, visualisations).
