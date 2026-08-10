@@ -1,199 +1,539 @@
 import streamlit as st
 import pandas as pd
 import plotly.graph_objects as go
+import plotly.express as px
 from utils.supabase_client import get_client
 
-st.title("📊 Visualisations - Pass Map")
 
-# ----------------------------------------------------------------------
-# Le "plein écran" qui casse tout n'est pas celui de Plotly (la petite
-# barre d'icônes camera/zoom/pan) : c'est le bouton natif que Streamlit
-# rajoute lui-même au survol de CHAQUE graphique (icône "agrandir" en
-# haut à droite). C'est un bug Streamlit connu et non résolu depuis des
-# années (cf. issues GitHub #1154 et #5644) : au retour du plein écran,
-# le conteneur du graphique reste coincé à une taille minuscule.
-# Comme tu t'en fiches de pouvoir zoomer/agrandir, la solution la plus
-# fiable est de supprimer ce bouton pour qu'il ne puisse plus jamais
-# être déclenché. Ce CSS masque le "toolbar" qui apparaît au survol de
-# tous les éléments de la page (graphiques, images, dataframes...).
-st.markdown(
-    """
-    <style>
-    [data-testid="stElementToolbar"] { display: none !important; }
-    [data-testid="StyledFullScreenButton"] { display: none !important; }
-    button[title="View fullscreen"] { display: none !important; }
-    </style>
-    """,
-    unsafe_allow_html=True,
-)
+# ============================================================
+# 1. PAGE CONFIG, CONSTANTS, COLOR PALETTE
+# ============================================================
+
+st.set_page_config(layout="wide")
+st.title("Player Dashboard")
+
+PITCH_LENGTH_M = 105.0
+PITCH_WIDTH_M = 68.0
+ASPECT_RATIO = PITCH_WIDTH_M / PITCH_LENGTH_M
+
+PITCH_FIG_WIDTH = 800
+PITCH_MARGIN = dict(l=10, r=10, t=10, b=10)
+_plot_area_width = PITCH_FIG_WIDTH - PITCH_MARGIN["l"] - PITCH_MARGIN["r"]
+_plot_area_height = _plot_area_width * ASPECT_RATIO
+PITCH_FIG_HEIGHT = round(_plot_area_height + PITCH_MARGIN["t"] + PITCH_MARGIN["b"])
+
+BUTTON_GROUPS = {
+    "Passes": ["Passes"],
+    "Attacking actions": ["Shots", "Dribbles"],
+    "Defensive actions": ["Tackles", "Interceptions", "Clearances", "Recoveries", "Aerial duels"],
+    "Other": ["Fouls", "Cards"],
+}
+
+EVENT_CATEGORIES = {
+    "Passes":        {"types": ["Pass"], "draw": "line"},
+    "Shots":         {"types": ["Goal", "SavedShot", "MissedShots", "ShotOnPost"], "draw": "shot"},
+    "Dribbles":      {"types": ["TakeOn"], "draw": "point"},
+    "Tackles":       {"types": ["Tackle"], "draw": "point"},
+    "Interceptions": {"types": ["Interception"], "draw": "point"},
+    "Clearances":    {"types": ["Clearance"], "draw": "point"},
+    "Recoveries":    {"types": ["BallRecovery"], "draw": "point"},
+    "Aerial duels":  {"types": ["Aerial"], "draw": "point"},
+    "Fouls":         {"types": ["Foul"], "draw": "point"},
+    "Cards":         {"types": ["Card"], "draw": "point"},
+}
+
+CATEGORY_COLOR = {
+    "Passes": "#00e5ff",
+    "Shots": "#ff9800",
+    "Dribbles": "#ff80ab",
+    "Tackles": "#69f0ae",
+    "Interceptions": "#ffd740",
+    "Clearances": "#40c4ff",
+    "Recoveries": "#8bc34a",
+    "Aerial duels": "#b388ff",
+    "Fouls": "#ff6e40",
+    "Cards": "#d500f9",
+}
+
+CATEGORY_SPLIT_COLUMN = {
+    "Passes": "outcome_type",
+    "Shots": "type",
+    "Dribbles": "outcome_type",
+    "Tackles": "outcome_type",
+    "Aerial duels": "outcome_type",
+    "Interceptions": None,
+    "Clearances": None,
+    "Recoveries": None,
+    "Fouls": None,
+    "Cards": "card_type",
+}
+
+SUBTYPE_STYLES = {
+    ("Passes", "Successful"):   {"label": "Successful passes", "color": "#00e5ff", "symbol": "circle"},
+    ("Passes", "Unsuccessful"): {"label": "Unsuccessful passes", "color": "#ff5252", "symbol": "circle"},
+
+    ("Shots", "Goal"):        {"label": "Goal", "color": "#ffd700", "symbol": "star"},
+    ("Shots", "SavedShot"):   {"label": "Shot on target", "color": "#ff9800", "symbol": "diamond"},
+    ("Shots", "MissedShots"): {"label": "Shot off target", "color": "#9e9e9e", "symbol": "circle-open"},
+    ("Shots", "ShotOnPost"):  {"label": "Post", "color": "#795548", "symbol": "cross"},
+
+    ("Dribbles", "Successful"):   {"label": "Successful dribbles", "color": "#ff80ab", "symbol": "circle"},
+    ("Dribbles", "Unsuccessful"): {"label": "Unsuccessful dribbles", "color": "#880e4f", "symbol": "circle"},
+
+    ("Tackles", "Successful"):   {"label": "Successful tackles", "color": "#69f0ae", "symbol": "circle"},
+    ("Tackles", "Unsuccessful"): {"label": "Unsuccessful tackles", "color": "#1b5e20", "symbol": "circle"},
+
+    ("Aerial duels", "Successful"):   {"label": "Aerial duels won", "color": "#b388ff", "symbol": "circle"},
+    ("Aerial duels", "Unsuccessful"): {"label": "Aerial duels lost", "color": "#4a148c", "symbol": "circle"},
+
+    ("Interceptions", "*"): {"label": "Interceptions", "color": "#ffd740", "symbol": "circle"},
+    ("Clearances", "*"):    {"label": "Clearances", "color": "#40c4ff", "symbol": "circle"},
+    ("Recoveries", "*"):    {"label": "Recoveries", "color": "#8bc34a", "symbol": "circle"},
+    ("Fouls", "*"):         {"label": "Fouls committed", "color": "#ff6e40", "symbol": "circle"},
+
+    ("Cards", "Yellow"):       {"label": "Yellow card", "color": "#ffeb3b", "symbol": "square"},
+    ("Cards", "SecondYellow"): {"label": "Second yellow", "color": "#ff6f00", "symbol": "square"},
+    ("Cards", "Red"):          {"label": "Red card", "color": "#f44336", "symbol": "square"},
+}
+
+
+# ============================================================
+# 2. DATA CONNECTION AND FETCHING
+# ============================================================
 
 supabase = get_client()
 
-# --- Sélection du joueur ---
-players_resp = supabase.table("players").select("player_id, player_name").execute()
-df_players = pd.DataFrame(players_resp.data)
 
-player_choice = st.selectbox("Choisis un joueur", df_players["player_name"].sort_values())
-player_id = df_players[df_players["player_name"] == player_choice]["player_id"].iloc[0]
+@st.cache_data
+def get_players() -> pd.DataFrame:
+    resp = supabase.table("players").select("player_id, player_name, position").execute()
+    return pd.DataFrame(resp.data)
 
-# --- Récupération des matchs de ce joueur ---
-matches_resp = supabase.table("player_match_stats").select("match_id").eq("player_id", int(player_id)).execute()
-match_ids = [row["match_id"] for row in matches_resp.data]
 
-# --- Récupération des infos (équipes + journée) pour ces matchs précis ---
-match_info_resp = supabase.table("football_match").select(
-    "game_id, home_team:home_team_id(team_name), away_team:away_team_id(team_name), matchday"
-).in_("game_id", match_ids).execute()
+@st.cache_data
+def get_player_match_ids(player_id: int) -> list:
+    resp = supabase.table("player_match_stats").select("match_id").eq("player_id", player_id).execute()
+    return [row["match_id"] for row in resp.data]
 
-df_matches_info = pd.DataFrame(match_info_resp.data)
-df_matches_info["home_team"] = df_matches_info["home_team"].apply(lambda x: x["team_name"])
-df_matches_info["away_team"] = df_matches_info["away_team"].apply(lambda x: x["team_name"])
-df_matches_info["match_label"] = (
-    df_matches_info["home_team"] + " - " + df_matches_info["away_team"]
-    + " (J" + df_matches_info["matchday"].astype(str) + ")"
-)
 
-# --- Le selectbox affiche le texte lisible, mais on garde le vrai game_id derrière ---
-match_choice_label = st.selectbox("Choisis un match", df_matches_info["match_label"])
-match_choice = df_matches_info[df_matches_info["match_label"] == match_choice_label]["game_id"].iloc[0]
+@st.cache_data
+def get_matches_info(match_ids: tuple) -> pd.DataFrame:
+    resp = supabase.table("football_match").select(
+        "game_id, home_team:home_team_id(team_name), away_team:away_team_id(team_name), matchday"
+    ).in_("game_id", list(match_ids)).execute()
+    return pd.DataFrame(resp.data)
 
-# --- Récupération des passes de ce joueur, sur ce match ---
-events_resp = supabase.table("events").select(
-    "x, y, end_x, end_y, outcome_type"
-).eq("player_id", int(player_id)).eq("match_id", int(match_choice)).eq("type", "Pass").execute()
 
-df_passes = pd.DataFrame(events_resp.data)
+@st.cache_data
+def get_events(player_id: int, match_id: int, types: tuple) -> pd.DataFrame:
+    if not types:
+        return pd.DataFrame()
+    resp = supabase.table("events").select(
+        "x, y, end_x, end_y, goal_mouth_y, outcome_type, type, minute, period, card_type"
+    ).eq("player_id", player_id).eq("match_id", match_id).in_("type", list(types)).execute()
+    return pd.DataFrame(resp.data)
 
-if df_passes.empty:
-    st.warning("Aucune passe trouvée pour ce joueur sur ce match.")
-else:
-    # ------------------------------------------------------------------
-    # 1) Proportions réelles du terrain (105 m x 68 m), calculées une
-    #    fois pour toutes. C'est cette valeur qui remplace le "0.65"
-    #    choisi à l'oeil dans la version précédente.
-    # ------------------------------------------------------------------
-    PITCH_LENGTH_M = 105.0
-    PITCH_WIDTH_M = 68.0
-    ASPECT_RATIO = PITCH_WIDTH_M / PITCH_LENGTH_M  # ≈ 0.6476
 
-    # ------------------------------------------------------------------
-    # 2) Taille de la figure FIXÉE des deux côtés (largeur ET hauteur),
-    #    calculée pour que la zone de tracé colle exactement au ratio
-    #    ci-dessus. C'est le point clé qui corrige le bug de
-    #    rétrécissement : Plotly n'a plus jamais besoin de "deviner"
-    #    une hauteur à partir du conteneur, donc il n'y a plus rien
-    #    à recalculer (et donc à casser) au plein écran ou au resize.
-    # ------------------------------------------------------------------
-    FIG_WIDTH = 900
-    MARGIN = dict(l=10, r=10, t=10, b=10)
-    plot_area_width = FIG_WIDTH - MARGIN["l"] - MARGIN["r"]
-    plot_area_height = plot_area_width * ASPECT_RATIO
-    FIG_HEIGHT = round(plot_area_height + MARGIN["t"] + MARGIN["b"])
+# ============================================================
+# 3. UTILITY FUNCTIONS
+# ============================================================
 
+def unwrap(df: pd.DataFrame, column: str, key: str) -> pd.Series:
+    return df[column].apply(lambda x: x[key] if isinstance(x, dict) else None)
+
+
+def build_match_label(df_matches: pd.DataFrame) -> pd.DataFrame:
+    df_matches = df_matches.copy()
+    df_matches["home_team"] = unwrap(df_matches, "home_team", "team_name")
+    df_matches["away_team"] = unwrap(df_matches, "away_team", "team_name")
+    df_matches["match_label"] = (
+        df_matches["home_team"] + " - " + df_matches["away_team"]
+        + " (MD" + df_matches["matchday"].astype(str) + ")"
+    )
+    return df_matches
+
+
+def default_groups_for_position(position: str) -> list:
+    if position in ("Defender", "Goalkeeper"):
+        return ["Passes"]
+    if position == "Forward":
+        return ["Attacking actions"]
+    return ["Passes", "Attacking actions"]
+
+
+# ============================================================
+# 4. PITCH CONSTRUCTION
+# ============================================================
+
+def build_pitch_base_figure() -> go.Figure:
     fig = go.Figure()
 
-    # Contour du terrain
     fig.add_shape(type="rect", x0=0, y0=0, x1=100, y1=100, line=dict(color="white", width=2))
-
-    # Ligne médiane
     fig.add_shape(type="line", x0=50, y0=0, x1=50, y1=100, line=dict(color="white", width=1))
-
-    # Rond central — coordonnées corrigées.
-    # Avant : x0=41,y0=32,x1=59,y1=68 (rayon 9 en x, 18 en y) : une fois
-    # le ratio 0.6476 appliqué à l'axe y, ça donnait une ellipse, pas un
-    # cercle. Un vrai rond central fait 9,15 m de rayon ; converti dans
-    # le repère 0-100 (x sur 105 m, y sur 68 m), ça donne un rayon
-    # d'environ 8,7 unités en x et 13,5 unités en y.
     fig.add_shape(type="circle", x0=41.3, y0=36.5, x1=58.7, y1=63.5, line=dict(color="white", width=1))
-
-    # Surface de réparation gauche
     fig.add_shape(type="rect", x0=0, y0=21.1, x1=17, y1=78.9, line=dict(color="white", width=1))
-
-    # Surface de réparation droite
     fig.add_shape(type="rect", x0=83, y0=21.1, x1=100, y1=78.9, line=dict(color="white", width=1))
-
-    # Petite surface (6 yards) gauche
     fig.add_shape(type="rect", x0=0, y0=36.8, x1=5.8, y1=63.2, line=dict(color="white", width=1))
-
-    # Petite surface (6 yards) droite
     fig.add_shape(type="rect", x0=94.2, y0=36.8, x1=100, y1=63.2, line=dict(color="white", width=1))
 
-    # Traces des passes — une trace par catégorie = légende cliquable native
-    for outcome, couleur, label in [("Successful", "cyan", "Réussie"), ("Unsuccessful", "red", "Ratée")]:
-        subset = df_passes[df_passes["outcome_type"] == outcome]
-        if subset.empty:
-            continue
+    fig.update_layout(
+        autosize=False,
+        width=PITCH_FIG_WIDTH,
+        height=PITCH_FIG_HEIGHT,
+        plot_bgcolor="#0d5c2e",
+        paper_bgcolor="rgba(0,0,0,0)",
+        xaxis=dict(range=[0, 100], showgrid=False, zeroline=False, visible=False, constrain="domain"),
+        yaxis=dict(range=[0, 100], showgrid=False, zeroline=False, visible=False,
+                    scaleanchor="x", scaleratio=ASPECT_RATIO, constrain="domain"),
+        margin=PITCH_MARGIN,
+        showlegend=True,
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0),
+    )
+    return fig
 
-        x_coords = []
-        y_coords = []
-        for _, row in subset.iterrows():
-            x_coords += [row["x"], row["end_x"], None]
-            y_coords += [row["y"], row["end_y"], None]
 
+def _add_line_trace(fig: go.Figure, df: pd.DataFrame, style: dict) -> None:
+    if df.empty:
+        return
+    x_coords, y_coords = [], []
+    for _, row in df.iterrows():
+        x_coords += [row["x"], row["end_x"], None]
+        y_coords += [row["y"], row["end_y"], None]
+
+    fig.add_trace(go.Scatter(
+        x=x_coords, y=y_coords,
+        mode="lines+markers",
+        line=dict(color=style["color"], width=2),
+        marker=dict(size=5),
+        name=style["label"],
+    ))
+
+
+def _add_point_trace(fig: go.Figure, df: pd.DataFrame, style: dict) -> None:
+    if df.empty:
+        return
+    fig.add_trace(go.Scatter(
+        x=df["x"], y=df["y"],
+        mode="markers",
+        marker=dict(size=11, color=style["color"], symbol=style["symbol"], line=dict(width=1, color="white")),
+        name=style["label"],
+    ))
+
+
+def _add_shot_trace(fig: go.Figure, df: pd.DataFrame, style: dict) -> None:
+    if df.empty:
+        return
+
+    x_line, y_line = [], []
+    for _, row in df.iterrows():
+        if pd.notna(row.get("goal_mouth_y")):
+            x_line += [row["x"], 100, None]
+            y_line += [row["y"], row["goal_mouth_y"], None]
+
+    if x_line:
         fig.add_trace(go.Scatter(
-            x=x_coords, y=y_coords,
-            mode="lines+markers",
-            line=dict(color=couleur, width=1.5),
-            marker=dict(size=4),
-            name=label
+            x=x_line, y=y_line,
+            mode="lines",
+            line=dict(color=style["color"], width=1.5, dash="dot"),
+            legendgroup=style["label"],
+            showlegend=False,
+            hoverinfo="skip",
         ))
 
+    fig.add_trace(go.Scatter(
+        x=df["x"], y=df["y"],
+        mode="markers",
+        marker=dict(size=11, color=style["color"], symbol=style["symbol"], line=dict(width=1, color="white")),
+        name=style["label"],
+        legendgroup=style["label"],
+    ))
+
+
+_DRAW_FUNCTIONS = {
+    "line": _add_line_trace,
+    "point": _add_point_trace,
+    "shot": _add_shot_trace,
+}
+
+
+def add_category_traces(fig: go.Figure, category: str, df_cat: pd.DataFrame) -> None:
+    if df_cat.empty:
+        return
+
+    draw_mode = EVENT_CATEGORIES[category]["draw"]
+    add_trace_fn = _DRAW_FUNCTIONS[draw_mode]
+    split_col = CATEGORY_SPLIT_COLUMN.get(category)
+
+    if split_col is None:
+        style = SUBTYPE_STYLES[(category, "*")]
+        add_trace_fn(fig, df_cat, style)
+        return
+
+    for value in df_cat[split_col].dropna().unique():
+        style = SUBTYPE_STYLES.get((category, value))
+        if style is None:
+            continue
+        subset = df_cat[df_cat[split_col] == value]
+        add_trace_fn(fig, subset, style)
+
+
+def build_full_pitch(events_by_category: dict) -> go.Figure:
+    fig = build_pitch_base_figure()
+    for category, df_cat in events_by_category.items():
+        add_category_traces(fig, category, df_cat)
+    return fig
+
+
+# ============================================================
+# 5. STATS CHARTS (FOR CAROUSEL SLIDES)
+# ============================================================
+
+def build_counts_bar_chart(events_by_category: dict) -> go.Figure:
+    labels = list(events_by_category.keys())
+    counts = [len(df) for df in events_by_category.values()]
+    colors = [CATEGORY_COLOR[c] for c in labels]
+
+    fig = go.Figure(go.Bar(
+        x=counts, y=labels, orientation="h",
+        marker=dict(color=colors),
+        text=counts, textposition="outside",
+    ))
     fig.update_layout(
-        # autosize=False : Plotly ne doit JAMAIS recalculer width/height
-        # tout seul à partir de la taille du conteneur. C'est la cause
-        # racine du rétrécissement au plein écran/resize : avec
-        # autosize=True (ou implicite) + scaleanchor, chaque événement
-        # de resize redéclenche un calcul qui peut se dégrader et finir
-        # par donner une figure minuscule.
-        autosize=False,
-        width=FIG_WIDTH,
-        height=FIG_HEIGHT,
+        paper_bgcolor="rgba(0,0,0,0)",
+        plot_bgcolor="rgba(0,0,0,0)",
+        margin=dict(l=10, r=10, t=10, b=10),
+        xaxis=dict(showgrid=False, visible=False),
+        height=max(250, 45 * len(labels)),
+    )
+    return fig
 
-        plot_bgcolor="#1a6b1a",
-        paper_bgcolor="white",
 
-        xaxis=dict(
-            range=[0, 100], showgrid=False, zeroline=False, visible=False,
-            # constrain="domain" : si jamais range et domain ne
-            # correspondent pas exactement (ex: petit écart d'arrondi),
-            # Plotly réduit la ZONE affichée plutôt que de laisser de
-            # l'espace vide coloré autour du terrain.
-            constrain="domain",
-        ),
-        yaxis=dict(
-            range=[0, 100], showgrid=False, zeroline=False, visible=False,
-            scaleanchor="x", scaleratio=ASPECT_RATIO,
-            constrain="domain",
-        ),
+def build_pass_donut(df_passes: pd.DataFrame):
+    if df_passes.empty:
+        return None
+    counts = df_passes["outcome_type"].value_counts().reset_index()
+    counts.columns = ["outcome_type", "count"]
+    counts["label"] = counts["outcome_type"].map({"Successful": "Successful", "Unsuccessful": "Unsuccessful"})
 
-        margin=MARGIN,
-        showlegend=True,
+    fig = px.pie(
+        counts, names="label", values="count", hole=0.6,
+        color="label", color_discrete_map={"Successful": "#00e5ff", "Unsuccessful": "#ff5252"},
+    )
+    fig.update_traces(textinfo="percent", textfont_size=14)
+    fig.update_layout(
+        margin=dict(l=10, r=10, t=10, b=10),
+        paper_bgcolor="rgba(0,0,0,0)",
+        legend=dict(orientation="h", yanchor="bottom", y=-0.15, xanchor="center", x=0.5),
+    )
+    return fig
+
+
+def build_shot_outcome_donut(df_shots: pd.DataFrame):
+    if df_shots.empty:
+        return None
+    label_map = {"Goal": "Goal", "SavedShot": "On target", "MissedShots": "Off target", "ShotOnPost": "Post"}
+    counts = df_shots["type"].map(label_map).value_counts().reset_index()
+    counts.columns = ["label", "count"]
+
+    fig = px.pie(
+        counts, names="label", values="count", hole=0.6,
+        color="label",
+        color_discrete_map={"Goal": "#ffd700", "On target": "#ff9800", "Off target": "#9e9e9e", "Post": "#795548"},
+    )
+    fig.update_traces(textinfo="percent", textfont_size=14)
+    fig.update_layout(
+        margin=dict(l=10, r=10, t=10, b=10),
+        paper_bgcolor="rgba(0,0,0,0)",
+        legend=dict(orientation="h", yanchor="bottom", y=-0.15, xanchor="center", x=0.5),
+    )
+    return fig
+
+
+def build_half_comparison_chart(events_by_category: dict):
+    rows = []
+    for category, df_cat in events_by_category.items():
+        if df_cat.empty or "period" not in df_cat.columns:
+            continue
+        for half_label, half_value in [("1st half", "FirstHalf"), ("2nd half", "SecondHalf")]:
+            rows.append({
+                "Category": category,
+                "Half": half_label,
+                "count": (df_cat["period"] == half_value).sum(),
+            })
+
+    if not rows:
+        return None
+
+    df_plot = pd.DataFrame(rows)
+    fig = px.bar(
+        df_plot, x="count", y="Category", color="Half", orientation="h", barmode="group",
+        color_discrete_map={"1st half": "#546e7a", "2nd half": "#eceff1"},
+    )
+    fig.update_layout(
+        paper_bgcolor="rgba(0,0,0,0)",
+        plot_bgcolor="rgba(0,0,0,0)",
+        margin=dict(l=10, r=10, t=10, b=10),
+        xaxis=dict(showgrid=False, title=None),
+        yaxis=dict(title=None),
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0),
+    )
+    return fig
+
+
+# ============================================================
+# 6. HOME-MADE CAROUSEL (buttons + dots, via session_state)
+# ============================================================
+
+def render_carousel(slides: list) -> None:
+    state_key = "carousel_index"
+    if state_key not in st.session_state:
+        st.session_state[state_key] = 0
+
+    st.session_state[state_key] %= len(slides)
+
+    nav_prev, nav_title, nav_next = st.columns([1, 6, 1])
+    with nav_prev:
+        if st.button("◀", use_container_width=True, key="carousel_prev"):
+            st.session_state[state_key] = (st.session_state[state_key] - 1) % len(slides)
+    with nav_next:
+        if st.button("▶", use_container_width=True, key="carousel_next"):
+            st.session_state[state_key] = (st.session_state[state_key] + 1) % len(slides)
+
+    current_index = st.session_state[state_key]
+    title, render_fn = slides[current_index]
+
+    with nav_title:
+        st.markdown(f"<h4 style='text-align:center;'>{title}</h4>", unsafe_allow_html=True)
+
+    dots = "".join("●" if i == current_index else "○" for i in range(len(slides)))
+    st.markdown(f"<p style='text-align:center; letter-spacing:6px;'>{dots}</p>", unsafe_allow_html=True)
+
+    render_fn()
+
+
+# ============================================================
+# 7. PLAYER AND MATCH SELECTION
+# ============================================================
+
+col_select1, col_select2 = st.columns(2)
+
+with col_select1:
+    df_players = get_players()
+    player_choice = st.selectbox("Select a player", df_players["player_name"].sort_values())
+    player_row = df_players[df_players["player_name"] == player_choice].iloc[0]
+    player_id = int(player_row["player_id"])
+    player_position = player_row["position"] if pd.notna(player_row["position"]) else "Unknown position"
+    st.caption(f"Position: {player_position}")
+
+match_ids = get_player_match_ids(player_id)
+df_matches_info = build_match_label(get_matches_info(tuple(match_ids)))
+
+with col_select2:
+    match_choice_label = st.selectbox("Select a match", df_matches_info["match_label"])
+match_choice = int(df_matches_info[df_matches_info["match_label"] == match_choice_label]["game_id"].iloc[0])
+
+st.divider()
+
+
+# ============================================================
+# 8. EVENT FILTERS (4 GROUPED BUTTONS) — ABOVE THE PITCH
+# ============================================================
+
+col_pitch, col_stats = st.columns([2, 1])
+
+with col_pitch:
+    selected_groups = st.pills(
+        "Stats to display on the pitch",
+        options=list(BUTTON_GROUPS.keys()),
+        selection_mode="multi",
+        default=default_groups_for_position(player_position),
+        key=f"group_pills_{player_id}",
     )
 
+selected_categories = []
+for group in selected_groups:
+    selected_categories.extend(BUTTON_GROUPS[group])
+
+
+# ============================================================
+# 9. FETCHING EVENTS FOR EACH ACTIVE CATEGORY
+# ============================================================
+
+events_by_category = {}
+for category in selected_categories:
+    config = EVENT_CATEGORIES[category]
+    df_cat = get_events(player_id, match_choice, tuple(config["types"]))
+
+    if category == "Fouls" and not df_cat.empty:
+        df_cat = df_cat[df_cat["outcome_type"] == "Unsuccessful"]
+
+    events_by_category[category] = df_cat
+
+
+# ============================================================
+# 10. DISPLAY: PITCH (ALWAYS VISIBLE) + STATS CAROUSEL
+# ============================================================
+
+with col_pitch:
+    fig_pitch = build_full_pitch(events_by_category)
     st.plotly_chart(
-        fig,
-        # width/height en entier (pixels) : depuis les versions récentes
-        # de Streamlit, ce sont ces paramètres qui remplacent
-        # use_container_width (déprécié). Un entier = taille FIXE du
-        # composant Streamlit lui-même, indépendante de la largeur du
-        # conteneur/de la fenêtre. Comme la figure interne a exactement
-        # la même taille, il n'y a plus aucun recalcul à faire nulle
-        # part : c'est ce qui garantit une taille stable au chargement,
-        # après plein écran, après resize, et après changement de
-        # sélection.
-        width=FIG_WIDTH,
-        height=FIG_HEIGHT,
-        # config responsive=False : empêche explicitement Plotly.js
-        # d'attacher un listener de resize de fenêtre au graphique
-        # (redimensionnement de la fenêtre du navigateur, rerun suite à
-        # un changement de sélection, etc.).
-        # displayModeBar=False : supprime la barre d'icônes de Plotly
-        # (zoom, pan, export PNG...). Tu as dit ne pas en avoir besoin,
-        # et ça évite qu'elle chevauche la légende.
+        fig_pitch,
+        width=PITCH_FIG_WIDTH,
+        height=PITCH_FIG_HEIGHT,
         config={"responsive": False, "displayModeBar": False},
-        # key unique par joueur/match : force Streamlit à recréer le
-        # composant graphique proprement à chaque changement de
-        # sélection, plutôt que d'essayer de réutiliser/patcher l'état
-        # (taille comprise) du graphique précédent.
-        key=f"pass_map_{player_id}_{match_choice}",
+        key=f"pitch_{player_id}_{match_choice}_{'-'.join(selected_groups)}",
     )
+
+with col_stats:
+    if not selected_categories:
+        st.info("Select at least one stat above to see the details.")
+    else:
+        total_events = sum(len(df) for df in events_by_category.values())
+        st.metric("Events displayed", total_events)
+
+        def render_overview():
+            st.plotly_chart(
+                build_counts_bar_chart(events_by_category),
+                use_container_width=True,
+                config={"displayModeBar": False},
+                key=f"bar_overview_{player_id}_{match_choice}",
+            )
+
+        def render_halves():
+            chart = build_half_comparison_chart(events_by_category)
+            if chart is not None:
+                st.plotly_chart(
+                    chart,
+                    use_container_width=True,
+                    config={"displayModeBar": False},
+                    key=f"bar_halves_{player_id}_{match_choice}",
+                )
+            else:
+                st.info("Not enough data to compare the two halves.")
+
+        slides = [
+            ("Overview", render_overview),
+            ("By half", render_halves),
+        ]
+
+        if "Passes" in events_by_category and not events_by_category["Passes"].empty:
+            def render_pass_donut():
+                st.plotly_chart(
+                    build_pass_donut(events_by_category["Passes"]),
+                    use_container_width=True,
+                    config={"displayModeBar": False},
+                    key=f"donut_pass_{player_id}_{match_choice}",
+                )
+            slides.append(("Pass accuracy", render_pass_donut))
+
+        if "Shots" in events_by_category and not events_by_category["Shots"].empty:
+            def render_shot_donut():
+                st.plotly_chart(
+                    build_shot_outcome_donut(events_by_category["Shots"]),
+                    use_container_width=True,
+                    config={"displayModeBar": False},
+                    key=f"donut_shots_{player_id}_{match_choice}",
+                )
+            slides.append(("Shot outcome", render_shot_donut))
+
+        render_carousel(slides)

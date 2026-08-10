@@ -2,6 +2,7 @@ import streamlit as st
 from utils.supabase_client import get_client
 import pandas as pd
 import ast
+st.set_page_config(layout="wide")
 
 st.title("🏆 Classements")
 
