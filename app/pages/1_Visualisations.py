@@ -1,3 +1,4 @@
+import json
 import streamlit as st
 import pandas as pd
 import plotly.graph_objects as go
@@ -55,8 +56,14 @@ CATEGORY_COLOR = {
     "Cards": "#d500f9",
 }
 
+CATEGORY_PRIORITY = [
+    "Passes", "Shots", "Tackles", "Dribbles",
+    "Interceptions", "Aerial duels", "Clearances", "Recoveries",
+    "Fouls", "Cards",
+]
+
 CATEGORY_SPLIT_COLUMN = {
-    "Passes": "outcome_type",
+    "Passes": "pass_subtype",
     "Shots": "type",
     "Dribbles": "outcome_type",
     "Tackles": "outcome_type",
@@ -71,6 +78,7 @@ CATEGORY_SPLIT_COLUMN = {
 SUBTYPE_STYLES = {
     ("Passes", "Successful"):   {"label": "Successful passes", "color": "#00e5ff", "symbol": "circle"},
     ("Passes", "Unsuccessful"): {"label": "Unsuccessful passes", "color": "#ff5252", "symbol": "circle"},
+    ("Passes", "Assist"):       {"label": "Assist", "color": "#ffd700", "symbol": "circle"},
 
     ("Shots", "Goal"):        {"label": "Goal", "color": "#ffd700", "symbol": "star"},
     ("Shots", "SavedShot"):   {"label": "Shot on target", "color": "#ff9800", "symbol": "diamond"},
@@ -125,11 +133,21 @@ def get_matches_info(match_ids: tuple) -> pd.DataFrame:
 
 
 @st.cache_data
+def get_match_summary(player_id: int, match_id: int) -> dict:
+    resp = supabase.table("player_match_stats").select(
+        "minutes_played, goals, assists, yellow_cards, red_cards"
+    ).eq("player_id", player_id).eq("match_id", match_id).execute()
+    if not resp.data:
+        return {}
+    return resp.data[0]
+
+
+@st.cache_data
 def get_events(player_id: int, match_id: int, types: tuple) -> pd.DataFrame:
     if not types:
         return pd.DataFrame()
     resp = supabase.table("events").select(
-        "x, y, end_x, end_y, goal_mouth_y, outcome_type, type, minute, period, card_type"
+        "event_pk, x, y, end_x, end_y, goal_mouth_y, outcome_type, type, minute, period, card_type, qualifiers"
     ).eq("player_id", player_id).eq("match_id", match_id).in_("type", list(types)).execute()
     return pd.DataFrame(resp.data)
 
@@ -142,6 +160,16 @@ def unwrap(df: pd.DataFrame, column: str, key: str) -> pd.Series:
     return df[column].apply(lambda x: x[key] if isinstance(x, dict) else None)
 
 
+def is_assist(qualifiers_raw) -> bool:
+    if not qualifiers_raw or pd.isna(qualifiers_raw):
+        return False
+    try:
+        qualifiers = json.loads(qualifiers_raw) if isinstance(qualifiers_raw, str) else qualifiers_raw
+    except (TypeError, ValueError):
+        return False
+    return any(q.get("type", {}).get("displayName") == "IntentionalGoalAssist" for q in qualifiers)
+
+
 def build_match_label(df_matches: pd.DataFrame) -> pd.DataFrame:
     df_matches = df_matches.copy()
     df_matches["home_team"] = unwrap(df_matches, "home_team", "team_name")
@@ -150,7 +178,7 @@ def build_match_label(df_matches: pd.DataFrame) -> pd.DataFrame:
         df_matches["home_team"] + " - " + df_matches["away_team"]
         + " (MD" + df_matches["matchday"].astype(str) + ")"
     )
-    return df_matches
+    return df_matches.sort_values("matchday")
 
 
 def default_groups_for_position(position: str) -> list:
@@ -195,16 +223,17 @@ def build_pitch_base_figure() -> go.Figure:
 def _add_line_trace(fig: go.Figure, df: pd.DataFrame, style: dict) -> None:
     if df.empty:
         return
-    x_coords, y_coords = [], []
+    x_coords, y_coords, sizes = [], [], []
     for _, row in df.iterrows():
         x_coords += [row["x"], row["end_x"], None]
         y_coords += [row["y"], row["end_y"], None]
+        sizes += [0, 9, 0]
 
     fig.add_trace(go.Scatter(
         x=x_coords, y=y_coords,
         mode="lines+markers",
         line=dict(color=style["color"], width=2),
-        marker=dict(size=5),
+        marker=dict(size=sizes),
         name=style["label"],
     ))
 
@@ -289,8 +318,8 @@ def build_full_pitch(events_by_category: dict) -> go.Figure:
 # ============================================================
 
 def build_counts_bar_chart(events_by_category: dict) -> go.Figure:
-    labels = list(events_by_category.keys())
-    counts = [len(df) for df in events_by_category.values()]
+    labels = [c for c in CATEGORY_PRIORITY if c in events_by_category]
+    counts = [len(events_by_category[c]) for c in labels]
     colors = [CATEGORY_COLOR[c] for c in labels]
 
     fig = go.Figure(go.Bar(
@@ -303,7 +332,33 @@ def build_counts_bar_chart(events_by_category: dict) -> go.Figure:
         plot_bgcolor="rgba(0,0,0,0)",
         margin=dict(l=10, r=10, t=10, b=10),
         xaxis=dict(showgrid=False, visible=False),
-        height=max(250, 45 * len(labels)),
+        yaxis=dict(autorange="reversed"),
+        height=max(300, 40 * len(labels)),
+    )
+    return fig
+
+
+def build_per90_bar_chart(events_by_category: dict, minutes_played):
+    if not minutes_played or minutes_played <= 0:
+        return None
+
+    labels = [c for c in CATEGORY_PRIORITY if c in events_by_category]
+    counts = [len(events_by_category[c]) for c in labels]
+    per90 = [count * 90 / minutes_played for count in counts]
+    colors = [CATEGORY_COLOR[c] for c in labels]
+
+    fig = go.Figure(go.Bar(
+        x=per90, y=labels, orientation="h",
+        marker=dict(color=colors),
+        text=[f"{v:.1f}" for v in per90], textposition="outside",
+    ))
+    fig.update_layout(
+        paper_bgcolor="rgba(0,0,0,0)",
+        plot_bgcolor="rgba(0,0,0,0)",
+        margin=dict(l=10, r=10, t=10, b=10),
+        xaxis=dict(showgrid=False, visible=False),
+        yaxis=dict(autorange="reversed"),
+        height=max(300, 40 * len(labels)),
     )
     return fig
 
@@ -423,7 +478,6 @@ with col_select1:
     player_row = df_players[df_players["player_name"] == player_choice].iloc[0]
     player_id = int(player_row["player_id"])
     player_position = player_row["position"] if pd.notna(player_row["position"]) else "Unknown position"
-    st.caption(f"Position: {player_position}")
 
 match_ids = get_player_match_ids(player_id)
 df_matches_info = build_match_label(get_matches_info(tuple(match_ids)))
@@ -431,6 +485,22 @@ df_matches_info = build_match_label(get_matches_info(tuple(match_ids)))
 with col_select2:
     match_choice_label = st.selectbox("Select a match", df_matches_info["match_label"])
 match_choice = int(df_matches_info[df_matches_info["match_label"] == match_choice_label]["game_id"].iloc[0])
+
+POSITION_COLORS = {"Goalkeeper": "orange", "Defender": "blue", "Midfielder": "green", "Forward": "red"}
+
+header_left, header_right = st.columns([2, 3])
+with header_left:
+    st.subheader(player_choice)
+    st.badge(player_position, color=POSITION_COLORS.get(player_position, "gray"))
+
+match_summary = get_match_summary(player_id, match_choice)
+with header_right:
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric("Minutes played", match_summary.get("minutes_played", "-"))
+    m2.metric("Goals", match_summary.get("goals", 0))
+    m3.metric("Assists", match_summary.get("assists", 0))
+    total_cards = (match_summary.get("yellow_cards") or 0) + (match_summary.get("red_cards") or 0)
+    m4.metric("Cards", total_cards)
 
 st.divider()
 
@@ -464,10 +534,27 @@ for category in selected_categories:
     config = EVENT_CATEGORIES[category]
     df_cat = get_events(player_id, match_choice, tuple(config["types"]))
 
+    if category == "Passes" and not df_cat.empty:
+        df_cat["pass_subtype"] = df_cat.apply(
+            lambda row: "Assist" if is_assist(row["qualifiers"]) else row["outcome_type"],
+            axis=1,
+        )
+
     if category == "Fouls" and not df_cat.empty:
         df_cat = df_cat[df_cat["outcome_type"] == "Unsuccessful"]
 
     events_by_category[category] = df_cat
+
+all_events_by_category = {}
+for category in CATEGORY_PRIORITY:
+    config = EVENT_CATEGORIES[category]
+    if category in events_by_category:
+        df_all_cat = events_by_category[category]
+    else:
+        df_all_cat = get_events(player_id, match_choice, tuple(config["types"]))
+        if category == "Fouls" and not df_all_cat.empty:
+            df_all_cat = df_all_cat[df_all_cat["outcome_type"] == "Unsuccessful"]
+    all_events_by_category[category] = df_all_cat
 
 
 # ============================================================
@@ -493,11 +580,24 @@ with col_stats:
 
         def render_overview():
             st.plotly_chart(
-                build_counts_bar_chart(events_by_category),
+                build_counts_bar_chart(all_events_by_category),
                 use_container_width=True,
                 config={"displayModeBar": False},
                 key=f"bar_overview_{player_id}_{match_choice}",
             )
+
+        def render_per90():
+            minutes = match_summary.get("minutes_played")
+            chart = build_per90_bar_chart(all_events_by_category, minutes)
+            if chart is not None:
+                st.plotly_chart(
+                    chart,
+                    use_container_width=True,
+                    config={"displayModeBar": False},
+                    key=f"bar_per90_{player_id}_{match_choice}",
+                )
+            else:
+                st.info("Minutes played not available for this match.")
 
         def render_halves():
             chart = build_half_comparison_chart(events_by_category)
@@ -513,6 +613,7 @@ with col_stats:
 
         slides = [
             ("Overview", render_overview),
+            ("Per 90 minutes", render_per90),
             ("By half", render_halves),
         ]
 
