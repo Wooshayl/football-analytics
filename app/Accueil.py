@@ -38,4 +38,4 @@ st.markdown('<div class="section-title">Player Comparison</div>', unsafe_allow_h
 st.page_link("pages/2_Comparatif_Joueurs.py", label="Open Player Comparison", use_container_width=True)
 
 st.divider()
-st.caption("Built with Python, pandas, scikit-learn, XGBoost, Supabase (PostgreSQL) and Streamlit.")
+st.caption("Built with Python, pandas, scikit-learn, XGBoost, Supabase (PostgreSQL) and Streamlit.")    
