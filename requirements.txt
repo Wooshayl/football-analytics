@@ -1,6 +1,6 @@
 streamlit
 pandas
-plotly
+plotly>=5.0
 supabase
 scikit-learn
 scipy
