@@ -350,7 +350,7 @@ def build_per90_bar_chart(events_by_category: dict, minutes_played):
     fig = go.Figure(go.Bar(
         x=per90, y=labels, orientation="h",
         marker=dict(color=colors),
-        text=[f"{v:.1f}" for v in per90], textposition="outside",
+        text=[f"{v:.2f}" for v in per90], textposition="outside",
     ))
     fig.update_layout(
         paper_bgcolor="rgba(0,0,0,0)",
@@ -486,7 +486,7 @@ with col_select2:
     match_choice_label = st.selectbox("Select a match", df_matches_info["match_label"])
 match_choice = int(df_matches_info[df_matches_info["match_label"] == match_choice_label]["game_id"].iloc[0])
 
-POSITION_COLORS = {"Goalkeeper": "orange", "Defender": "blue", "Midfielder": "green", "Forward": "red"}
+POSITION_COLORS = {"Goalkeeper": "orange", "Defender": "blue", "Midfield": "green", "Attack": "red"}
 
 header_left, header_right = st.columns([2, 3])
 with header_left:
